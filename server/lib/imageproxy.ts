@@ -7,6 +7,16 @@ import { createHash } from 'crypto';
 import { promises } from 'fs';
 import mime from 'mime';
 import path, { join } from 'path';
+import sharp from 'sharp';
+
+const WEBP_QUALITY = 80;
+const WEBP_EFFORT = 5;
+const CONVERTIBLE_TYPES = [
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+  'image/webp',
+];
 
 type ImageResponse = {
   meta: {
@@ -129,6 +139,9 @@ class ImageProxy {
     return 0;
   }
 
+  // Concurrent requests for the same image share a single download
+  private static inFlight = new Map<string, Promise<ImageResponse | null>>();
+
   private axios: AxiosInstance;
   private cacheVersion;
   private key;
@@ -230,10 +243,13 @@ class ImageProxy {
   private async get(cacheKey: string): Promise<ImageResponse | null> {
     try {
       const directory = join(this.getCacheDirectory(), cacheKey);
-      const files = await promises.readdir(directory);
+      const files = (await promises.readdir(directory))
+        .filter((file) => !file.endsWith('.tmp'))
+        .sort((a, b) => Number(b.split('.')[1]) - Number(a.split('.')[1]));
       const now = Date.now();
 
-      for (const file of files) {
+      // Newest entry wins; legacy entries in any format are served as-is
+      for (const file of files.slice(0, 1)) {
         const [maxAgeSt, expireAtSt, etag, extension] = file.split('.');
         const buffer = await promises.readFile(join(directory, file));
         const expireAt = Number(expireAtSt);
@@ -259,7 +275,18 @@ class ImageProxy {
     return null;
   }
 
-  private async set(
+  private set(path: string, cacheKey: string): Promise<ImageResponse | null> {
+    const existing = ImageProxy.inFlight.get(cacheKey);
+    if (existing) return existing;
+
+    const request = this.download(path, cacheKey).finally(() => {
+      ImageProxy.inFlight.delete(cacheKey);
+    });
+    ImageProxy.inFlight.set(cacheKey, request);
+    return request;
+  }
+
+  private async download(
     path: string,
     cacheKey: string
   ): Promise<ImageResponse | null> {
@@ -269,13 +296,35 @@ class ImageProxy {
         responseType: 'arraybuffer',
       });
 
-      const buffer = Buffer.from(response.data, 'binary');
+      let buffer = Buffer.from(response.data, 'binary');
 
-      const contentType = response.headers['content-type'] || '';
-      const extension = (mime.getExtension(contentType) || '').replace(
+      const contentType = (response.headers['content-type'] || '')
+        .split(';')[0]
+        .trim();
+      let extension = (mime.getExtension(contentType) || '').replace(
         /[^\w-]/g,
         ''
       );
+
+      // Re-encode to WebP (metadata is stripped by default); keep the original
+      // if conversion fails or does not make the file smaller
+      if (CONVERTIBLE_TYPES.includes(contentType)) {
+        try {
+          const webp = await sharp(buffer)
+            .rotate()
+            .webp({ quality: WEBP_QUALITY, effort: WEBP_EFFORT })
+            .toBuffer();
+          if (webp.length < buffer.length) {
+            buffer = webp;
+            extension = 'webp';
+          }
+        } catch (e) {
+          logger.debug('Failed to convert image to WebP; caching original.', {
+            label: 'Image Cache',
+            errorMessage: e.message,
+          });
+        }
+      }
 
       let maxAge = Number(
         (response.headers['cache-control'] ?? '0').split('=')[1]
@@ -325,12 +374,18 @@ class ImageProxy {
   ) {
     const filename = join(dir, `${maxAge}.${expireAt}.${etag}.${extension}`);
 
-    await promises.rm(dir, { force: true, recursive: true }).catch(() => {
-      // do nothing
-    });
-
     await promises.mkdir(dir, { recursive: true });
-    await promises.writeFile(filename, buffer);
+
+    // Write then rename so readers never see an empty or partial entry
+    await promises.writeFile(`${filename}.tmp`, buffer);
+    await promises.rename(`${filename}.tmp`, filename);
+
+    const files = await promises.readdir(dir);
+    for (const file of files) {
+      if (join(dir, file) !== filename) {
+        await promises.rm(join(dir, file), { force: true });
+      }
+    }
   }
 
   private getCacheKey(path: string) {

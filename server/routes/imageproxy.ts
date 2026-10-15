@@ -55,8 +55,11 @@ router.get<{
       return next({ status: 400, message: 'Unsupported image type.' });
     }
 
+    const extension =
+      imageData.meta.extension === 'jpg' ? 'jpeg' : imageData.meta.extension;
+
     res.writeHead(200, {
-      'Content-Type': `image/${imageData.meta.extension}`,
+      'Content-Type': `image/${extension}`,
       'Content-Length': imageData.imageBuffer.length,
       'Cache-Control': `public, max-age=${imageData.meta.curRevalidate}`,
       'OS-Cache-Key': imageData.meta.cacheKey,
