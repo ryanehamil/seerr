@@ -191,14 +191,6 @@ class ImageProxy {
       return newImage;
     }
 
-    // TEMPORARY: remove once cache hits are confirmed
-    logger.info(`Cache hit for ${this.key} ${path}`, {
-      label: 'Image Cache',
-      cacheKey,
-      extension: imageResponse.meta.extension,
-      isStale: imageResponse.meta.isStale,
-    });
-
     // If the image is stale, we will revalidate it in the background.
     if (imageResponse.meta.isStale) {
       this.set(path, cacheKey);
